@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/csv"
 	"flag"
@@ -9,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -31,8 +34,9 @@ var (
 	downloadSizeConfig = flag.Int("size", 1024*1024*100, "download size for testing proxies")
 	timeoutConfig      = flag.Duration("timeout", time.Second*5, "timeout for testing proxies")
 	sortField          = flag.String("sort", "b", "sort field for testing proxies, b for bandwidth, t for TTFB")
-	output             = flag.String("output", "", "output result to csv/yaml file")
+	output             = flag.String("output", "yaml", "output result to csv/yaml file")
 	concurrent         = flag.Int("concurrent", 4, "download concurrent size")
+	configMap          = make(map[string]any)
 )
 
 type CProxy struct {
@@ -68,6 +72,7 @@ func main() {
 	var allProxies = make(map[string]CProxy)
 	for _, configPath := range strings.Split(*configPathConfig, ",") {
 		var body []byte
+		var body1 []byte
 		var err error
 		if strings.HasPrefix(configPath, "http") {
 			var resp *http.Response
@@ -76,15 +81,24 @@ func main() {
 				log.Warnln("failed to fetch config: %s", err)
 				continue
 			}
-			body, err = io.ReadAll(resp.Body)
+			body1, err = io.ReadAll(resp.Body)
 		} else {
-			body, err = os.ReadFile(configPath)
+			body1, err = os.ReadFile(configPath)
 		}
 		if err != nil {
 			log.Warnln("failed to read config: %s", err)
 			continue
 		}
+		//去掉emoji
+		//body = emojiRegex.ReplaceAll(body1, []byte{})
+		if err := yaml.Unmarshal(body1, &configMap); err != nil {
+			log.Fatalln("fail to yaml.Unmarshal: %s", err)
+		}
+		body, err = yaml.Marshal(&configMap)
 
+		if err != nil {
+			log.Fatalln("Failed to Marshal : %s", err)
+		}
 		lps, err := loadProxies(body)
 		if err != nil {
 			log.Fatalln("Failed to convert : %s", err)
@@ -95,7 +109,18 @@ func main() {
 				allProxies[k] = p
 			}
 		}
+
+		//写入临时yaml文件
+		if err := wirteYamlTMP(filepath.Join("./", "tempclash.yaml"), body); err != nil {
+			log.Fatalln("Failed to write tampclash.yaml: %s", err)
+		}
 	}
+	cmd := `head -n $(grep -n "^proxies" tempclash.yaml | cut -d: -f1) tempclash.yaml > head.yaml`
+	exec.Command("sh", "-c", cmd).CombinedOutput()
+	cmd1 := `awk '/proxy-groups:/{flag=1; next} /rules:/{flag=0} flag' tempclash.yaml > groups.yaml`
+	exec.Command("sh", "-c", cmd1).CombinedOutput()
+	cmd2 := `sed -n '/rules:/,$p' tempclash.yaml > tail.yaml`
+	exec.Command("sh", "-c", cmd2).CombinedOutput()
 
 	filteredProxies := filterProxies(*filterRegexConfig, allProxies)
 	results := make([]Result, 0, len(filteredProxies))
@@ -147,6 +172,16 @@ func main() {
 			log.Fatalln("Failed to write csv: %s", err)
 		}
 	}
+	delDuplicate("groups.yaml", "naproxys.yaml", "newgroups.yaml")
+	addReject("newgroups.yaml", "newgroups1.yaml")
+	// cmd3 := `grep -v -f naproxys.yaml groups.yaml > newgroups.yaml`
+	// exec.Command("sh", "-c", cmd3).CombinedOutput()
+	cmd4 := `echo "proxy-groups:" >> result.yaml`
+	exec.Command("sh", "-c", cmd4).CombinedOutput()
+	cmd5 := `cat head.yaml result.yaml newgroups1.yaml tail.yaml > newclash.yaml`
+	exec.Command("sh", "-c", cmd5).CombinedOutput()
+	cmd6 := `rm head.yaml result.yaml newgroups.yaml newgroups1.yaml tail.yaml result.yaml naproxys.yaml tempclash.yaml groups.yaml`
+	exec.Command("sh", "-c", cmd6).CombinedOutput()
 }
 
 func filterProxies(filter string, proxies map[string]CProxy) []string {
@@ -208,7 +243,8 @@ func (r *Result) Printf(format string) {
 	} else if r.Bandwidth > 1024*1024*10 {
 		color = green
 	}
-	fmt.Printf(format, color, formatName(r.Name), formatBandwidth(r.Bandwidth), formatMilliseconds(r.TTFB))
+	//fmt.Printf(format, color, formatName(r.Name), formatBandwidth(r.Bandwidth), formatMilliseconds(r.TTFB))
+	fmt.Printf(format, color, r.Name, formatBandwidth(r.Bandwidth), formatMilliseconds(r.TTFB))
 }
 
 func TestProxyConcurrent(name string, proxy C.Proxy, downloadSize int, timeout time.Duration, concurrentCount int) *Result {
@@ -287,16 +323,17 @@ func TestProxy(name string, proxy C.Proxy, downloadSize int, timeout time.Durati
 	return &Result{name, bandwidth, ttfb}, written
 }
 
-var (
-	emojiRegex = regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{2600}-\x{26FF}\x{1F1E0}-\x{1F1FF}]`)
-	spaceRegex = regexp.MustCompile(`\s{2,}`)
-)
+// var (
+// 	emojiRegex = regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{2600}-\x{26FF}\x{1F1E0}-\x{1F1FF}]`)
+// 	//emojiRegex = regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{1F700}-\x{1F77F}\x{1F780}-\x{1F7FF}\x{1F800}-\x{1F8FF}\x{1F900}-\x{1F9FF}\x{2600}-\x{26FF}\x{2700}-\x{27BF}]+`)
+// 	spaceRegex = regexp.MustCompile(`\s{2,}`)
+// )
 
-func formatName(name string) string {
-	noEmoji := emojiRegex.ReplaceAllString(name, "")
-	mergedSpaces := spaceRegex.ReplaceAllString(noEmoji, " ")
-	return strings.TrimSpace(mergedSpaces)
-}
+// func formatName(name string) string {
+// 	noEmoji := emojiRegex.ReplaceAllString(name, "")
+// 	mergedSpaces := spaceRegex.ReplaceAllString(noEmoji, " ")
+// 	return strings.TrimSpace(mergedSpaces)
+// }
 
 func formatBandwidth(v float64) string {
 	if v <= 0 {
@@ -336,21 +373,53 @@ func writeNodeConfigurationToYAML(filePath string, results []Result, proxies map
 	defer fp.Close()
 
 	var sortedProxies []any
+	var unsortedProxies []any
+
 	for _, result := range results {
 		if v, ok := proxies[result.Name]; ok {
-			sortedProxies = append(sortedProxies, v.SecretConfig)
+			if result.TTFB > 0 {
+				sortedProxies = append(sortedProxies, v.SecretConfig)
+			} else {
+				unsortedProxies = append(unsortedProxies, result.Name)
+			}
 		}
 	}
 
 	bytes, err := yaml.Marshal(sortedProxies)
+
+	if err != nil {
+		return err
+	}
+	_, err = fp.Write(bytes)
+
 	if err != nil {
 		return err
 	}
 
-	_, err = fp.Write(bytes)
+	fp1, err := os.Create("naproxys.yaml")
+	if err != nil {
+		return err
+	}
+	defer fp1.Close()
+
+	bytes1, err := yaml.Marshal(unsortedProxies)
+	if err != nil {
+		return err
+	}
+	_, err = fp1.Write(bytes1)
 	return err
 }
+func wirteYamlTMP(path string, buf []byte) error {
+	dir := filepath.Dir(path)
 
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+
+	return os.WriteFile(path, buf, 0o666)
+}
 func writeToCSV(filePath string, results []Result) error {
 	csvFile, err := os.Create(filePath)
 	if err != nil {
@@ -379,4 +448,125 @@ func writeToCSV(filePath string, results []Result) error {
 	}
 	csvWriter.Flush()
 	return nil
+}
+func delDuplicate(file1 string, file2 string, file3 string) {
+
+	lines1, err := readLines(file1)
+	if err != nil {
+		fmt.Println("Error reading file1:", err)
+		return
+	}
+
+	lines2, err := readLines(file2)
+	if err != nil {
+		fmt.Println("Error reading file2:", err)
+		return
+	}
+
+	filteredLines := make([]string, 0, len(lines1))
+	for _, line1 := range lines1 {
+		if !stringInSlice(line1, lines2) {
+			filteredLines = append(filteredLines, line1)
+		}
+	}
+
+	// for _, line := range filteredLines {
+	// 	fmt.Println(line)
+	// }
+
+	// 创建文件
+	file, err := os.Create(file3)
+	if err != nil {
+		fmt.Println("Error creating file:", err)
+		return
+	}
+	defer file.Close() // 确保文件在函数结束时关闭
+
+	// 创建Writer
+	writer := bufio.NewWriter(file)
+
+	// 写入字符串到文件
+	for _, str := range filteredLines {
+		str = str + "\n"
+		_, err := writer.WriteString(str)
+		if err != nil {
+			fmt.Println("Error writing to file:", err)
+			return
+		}
+	}
+
+	// 清空缓冲区
+	err = writer.Flush()
+	if err != nil {
+		fmt.Println("Error flushing writer:", err)
+		return
+	}
+
+}
+
+func readLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	return lines, scanner.Err()
+}
+
+func stringInSlice(a string, list []string) bool {
+	for _, b := range list {
+		if strings.TrimSpace(a) == strings.TrimSpace(b) {
+			return true
+		}
+	}
+	return false
+}
+func addReject(file1 string, file2 string) {
+	lines1, err := readLines(file1)
+	if err != nil {
+		fmt.Println("Error reading file1:", err)
+		return
+	}
+	filteredLines := make([]string, 0, len(lines1)+10)
+	for i, line1 := range lines1 {
+		filteredLines = append(filteredLines, line1)
+		if strings.TrimSpace(line1) == "proxies:" {
+			if strings.TrimSpace(lines1[i+1]) == "tolerance: 20" {
+				filteredLines = append(filteredLines, "       - REJECT")
+			}
+		}
+	}
+	file, err := os.Create(file2)
+	if err != nil {
+		fmt.Println("Error creating file:", err)
+		return
+	}
+	defer file.Close() // 确保文件在函数结束时关闭
+
+	// 创建Writer
+	writer := bufio.NewWriter(file)
+
+	// 写入字符串到文件
+	for _, str := range filteredLines {
+		str = str + "\n"
+		_, err := writer.WriteString(str)
+		if err != nil {
+			fmt.Println("Error writing to file:", err)
+			return
+		}
+	}
+
+	// 清空缓冲区
+	err = writer.Flush()
+	if err != nil {
+		fmt.Println("Error flushing writer:", err)
+		return
+	}
 }
