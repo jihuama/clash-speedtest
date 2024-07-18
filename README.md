@@ -14,7 +14,7 @@ Features:
 
 ```bash
 # 推荐从源码安装
-> go install github.com/faceair/clash-speedtest
+> go install github.com/jihuama/clash-speedtest
 
 # 查看帮助
 > clash-speedtest -h
@@ -62,6 +62,7 @@ USA-GIA                                         14.42KB/s       688.00ms
 ```
 
 > 当您指定了 `--output yaml` 的时候，会自动将排序后的节点以完整配置输出，方便您编辑自己的节点文件
+> 输出结果为完整clash配置文件
 
 ## 如何使用自定义服务器进行测速
 
