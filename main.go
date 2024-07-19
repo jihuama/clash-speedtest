@@ -3,15 +3,12 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/csv"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -34,9 +31,10 @@ var (
 	downloadSizeConfig = flag.Int("size", 1024*1024*100, "download size for testing proxies")
 	timeoutConfig      = flag.Duration("timeout", time.Second*5, "timeout for testing proxies")
 	sortField          = flag.String("sort", "b", "sort field for testing proxies, b for bandwidth, t for TTFB")
-	output             = flag.String("output", "yaml", "output result to csv/yaml file")
+	output             = flag.String("output", "newclash.yaml", "output clash config file")
 	concurrent         = flag.Int("concurrent", 4, "download concurrent size")
 	configMap          = make(map[string]any)
+	effective          = 0
 )
 
 type CProxy struct {
@@ -68,31 +66,30 @@ func main() {
 	if *configPathConfig == "" {
 		log.Fatalln("Please specify the configuration file")
 	}
-
+	var body []byte
+	var body1 []byte
 	var allProxies = make(map[string]CProxy)
 	for _, configPath := range strings.Split(*configPathConfig, ",") {
-		var body []byte
-		var body1 []byte
+
 		var err error
 		if strings.HasPrefix(configPath, "http") {
 			var resp *http.Response
 			resp, err = http.Get(configPath)
 			if err != nil {
-				log.Warnln("failed to fetch config: %s", err)
-				continue
+				log.Fatalln("failed to fetch config: %s", err)
+
 			}
 			body1, err = io.ReadAll(resp.Body)
 		} else {
 			body1, err = os.ReadFile(configPath)
 		}
 		if err != nil {
-			log.Warnln("failed to read config: %s", err)
-			continue
+			log.Fatalln("failed to read config: %s", err)
+
 		}
-		//去掉emoji
-		//body = emojiRegex.ReplaceAll(body1, []byte{})
+
 		if err := yaml.Unmarshal(body1, &configMap); err != nil {
-			log.Fatalln("fail to yaml.Unmarshal: %s", err)
+			log.Fatalln("fail to Unmarshal: %s", err)
 		}
 		body, err = yaml.Marshal(&configMap)
 
@@ -109,18 +106,11 @@ func main() {
 				allProxies[k] = p
 			}
 		}
-
-		//写入临时yaml文件
-		if err := wirteYamlTMP(filepath.Join("./", "tempclash.yaml"), body); err != nil {
-			log.Fatalln("Failed to write tampclash.yaml: %s", err)
-		}
 	}
-	cmd := `head -n $(grep -n "^proxies" tempclash.yaml | cut -d: -f1) tempclash.yaml > head.yaml`
-	exec.Command("sh", "-c", cmd).CombinedOutput()
-	cmd1 := `awk '/proxy-groups:/{flag=1; next} /rules:/{flag=0} flag' tempclash.yaml > groups.yaml`
-	exec.Command("sh", "-c", cmd1).CombinedOutput()
-	cmd2 := `sed -n '/rules:/,$p' tempclash.yaml > tail.yaml`
-	exec.Command("sh", "-c", cmd2).CombinedOutput()
+
+	heads := getHead(body)
+	groups := getGroups(body)
+	tails := getTail(body)
 
 	filteredProxies := filterProxies(*filterRegexConfig, allProxies)
 	results := make([]Result, 0, len(filteredProxies))
@@ -148,12 +138,12 @@ func main() {
 			sort.Slice(results, func(i, j int) bool {
 				return results[i].Bandwidth > results[j].Bandwidth
 			})
-			fmt.Println("\n\n===结果按照带宽排序===")
+			fmt.Println("\n\n------------------------结果按照带宽排序------------------------")
 		case "t", "ttfb":
 			sort.Slice(results, func(i, j int) bool {
 				return results[i].TTFB < results[j].TTFB
 			})
-			fmt.Println("\n\n===结果按照延迟排序===")
+			fmt.Println("\n\n------------------------结果按照延迟排序------------------------")
 		default:
 			log.Fatalln("Unsupported sort field: %s", *sortField)
 		}
@@ -163,25 +153,17 @@ func main() {
 		}
 	}
 
-	if strings.EqualFold(*output, "yaml") {
-		if err := writeNodeConfigurationToYAML("result.yaml", results, allProxies); err != nil {
-			log.Fatalln("Failed to write yaml: %s", err)
-		}
-	} else if strings.EqualFold(*output, "csv") {
-		if err := writeToCSV("result.csv", results); err != nil {
-			log.Fatalln("Failed to write csv: %s", err)
-		}
+	Sorts, Unsorts, err := writeNodeConfigurationToYAML(results, allProxies)
+	if err != nil {
+		log.Fatalln("Failed to analyse yaml: %s", err)
 	}
-	delDuplicate("groups.yaml", "naproxys.yaml", "newgroups.yaml")
-	addReject("newgroups.yaml", "newgroups1.yaml")
-	// cmd3 := `grep -v -f naproxys.yaml groups.yaml > newgroups.yaml`
-	// exec.Command("sh", "-c", cmd3).CombinedOutput()
-	cmd4 := `echo "proxy-groups:" >> result.yaml`
-	exec.Command("sh", "-c", cmd4).CombinedOutput()
-	cmd5 := `cat head.yaml result.yaml newgroups1.yaml tail.yaml > newclash.yaml`
-	exec.Command("sh", "-c", cmd5).CombinedOutput()
-	cmd6 := `rm head.yaml result.yaml newgroups.yaml newgroups1.yaml tail.yaml result.yaml naproxys.yaml tempclash.yaml groups.yaml`
-	exec.Command("sh", "-c", cmd6).CombinedOutput()
+
+	naproxys := b2s(Unsorts)
+	newgroups := delDuplicate(groups, naproxys)
+	newgroups1 := addReject(newgroups)
+	genNewfile(*output, heads, Sorts, newgroups1, tails)
+	fmt.Printf("\nTest finished, there are %d effective nodes!\n", effective)
+	fmt.Printf("Output clash config file is %s.\n", *output)
 }
 
 func filterProxies(filter string, proxies map[string]CProxy) []string {
@@ -243,7 +225,6 @@ func (r *Result) Printf(format string) {
 	} else if r.Bandwidth > 1024*1024*10 {
 		color = green
 	}
-	//fmt.Printf(format, color, formatName(r.Name), formatBandwidth(r.Bandwidth), formatMilliseconds(r.TTFB))
 	fmt.Printf(format, color, r.Name, formatBandwidth(r.Bandwidth), formatMilliseconds(r.TTFB))
 }
 
@@ -323,18 +304,6 @@ func TestProxy(name string, proxy C.Proxy, downloadSize int, timeout time.Durati
 	return &Result{name, bandwidth, ttfb}, written
 }
 
-// var (
-// 	emojiRegex = regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{2600}-\x{26FF}\x{1F1E0}-\x{1F1FF}]`)
-// 	//emojiRegex = regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{1F700}-\x{1F77F}\x{1F780}-\x{1F7FF}\x{1F800}-\x{1F8FF}\x{1F900}-\x{1F9FF}\x{2600}-\x{26FF}\x{2700}-\x{27BF}]+`)
-// 	spaceRegex = regexp.MustCompile(`\s{2,}`)
-// )
-
-// func formatName(name string) string {
-// 	noEmoji := emojiRegex.ReplaceAllString(name, "")
-// 	mergedSpaces := spaceRegex.ReplaceAllString(noEmoji, " ")
-// 	return strings.TrimSpace(mergedSpaces)
-// }
-
 func formatBandwidth(v float64) string {
 	if v <= 0 {
 		return "N/A"
@@ -365,12 +334,7 @@ func formatMilliseconds(v time.Duration) string {
 	return fmt.Sprintf("%.02fms", float64(v.Milliseconds()))
 }
 
-func writeNodeConfigurationToYAML(filePath string, results []Result, proxies map[string]CProxy) error {
-	fp, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer fp.Close()
+func writeNodeConfigurationToYAML(results []Result, proxies map[string]CProxy) ([]byte, []byte, error) {
 
 	var sortedProxies []any
 	var unsortedProxies []any
@@ -379,145 +343,30 @@ func writeNodeConfigurationToYAML(filePath string, results []Result, proxies map
 		if v, ok := proxies[result.Name]; ok {
 			if result.TTFB > 0 {
 				sortedProxies = append(sortedProxies, v.SecretConfig)
+				effective++
 			} else {
 				unsortedProxies = append(unsortedProxies, result.Name)
 			}
 		}
 	}
 
-	bytes, err := yaml.Marshal(sortedProxies)
-
-	if err != nil {
-		return err
-	}
-	_, err = fp.Write(bytes)
-
-	if err != nil {
-		return err
-	}
-
-	fp1, err := os.Create("naproxys.yaml")
-	if err != nil {
-		return err
-	}
-	defer fp1.Close()
+	bytes, _ := yaml.Marshal(sortedProxies)
 
 	bytes1, err := yaml.Marshal(unsortedProxies)
-	if err != nil {
-		return err
-	}
-	_, err = fp1.Write(bytes1)
-	return err
+
+	return bytes, bytes1, err
 }
-func wirteYamlTMP(path string, buf []byte) error {
-	dir := filepath.Dir(path)
 
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
+func delDuplicate(buf1 []string, buf2 []string) []string {
 
-	return os.WriteFile(path, buf, 0o666)
-}
-func writeToCSV(filePath string, results []Result) error {
-	csvFile, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer csvFile.Close()
-
-	// 写入 UTF-8 BOM 头
-	csvFile.WriteString("\xEF\xBB\xBF")
-
-	csvWriter := csv.NewWriter(csvFile)
-	err = csvWriter.Write([]string{"节点", "带宽 (MB/s)", "延迟 (ms)"})
-	if err != nil {
-		return err
-	}
-	for _, result := range results {
-		line := []string{
-			result.Name,
-			fmt.Sprintf("%.2f", result.Bandwidth/1024/1024),
-			strconv.FormatInt(result.TTFB.Milliseconds(), 10),
-		}
-		err = csvWriter.Write(line)
-		if err != nil {
-			return err
-		}
-	}
-	csvWriter.Flush()
-	return nil
-}
-func delDuplicate(file1 string, file2 string, file3 string) {
-
-	lines1, err := readLines(file1)
-	if err != nil {
-		fmt.Println("Error reading file1:", err)
-		return
-	}
-
-	lines2, err := readLines(file2)
-	if err != nil {
-		fmt.Println("Error reading file2:", err)
-		return
-	}
-
-	filteredLines := make([]string, 0, len(lines1))
-	for _, line1 := range lines1 {
-		if !stringInSlice(line1, lines2) {
+	filteredLines := make([]string, 0, len(buf1))
+	for _, line1 := range buf1 {
+		if !stringInSlice(line1, buf2) {
 			filteredLines = append(filteredLines, line1)
 		}
 	}
+	return filteredLines
 
-	// for _, line := range filteredLines {
-	// 	fmt.Println(line)
-	// }
-
-	// 创建文件
-	file, err := os.Create(file3)
-	if err != nil {
-		fmt.Println("Error creating file:", err)
-		return
-	}
-	defer file.Close() // 确保文件在函数结束时关闭
-
-	// 创建Writer
-	writer := bufio.NewWriter(file)
-
-	// 写入字符串到文件
-	for _, str := range filteredLines {
-		str = str + "\n"
-		_, err := writer.WriteString(str)
-		if err != nil {
-			fmt.Println("Error writing to file:", err)
-			return
-		}
-	}
-
-	// 清空缓冲区
-	err = writer.Flush()
-	if err != nil {
-		fmt.Println("Error flushing writer:", err)
-		return
-	}
-
-}
-
-func readLines(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-
-	return lines, scanner.Err()
 }
 
 func stringInSlice(a string, list []string) bool {
@@ -528,45 +377,114 @@ func stringInSlice(a string, list []string) bool {
 	}
 	return false
 }
-func addReject(file1 string, file2 string) {
-	lines1, err := readLines(file1)
-	if err != nil {
-		fmt.Println("Error reading file1:", err)
-		return
-	}
-	filteredLines := make([]string, 0, len(lines1)+10)
-	for i, line1 := range lines1 {
+func addReject(buf []string) []string {
+
+	filteredLines := make([]string, 0, len(buf)+10)
+	for i, line1 := range buf {
 		filteredLines = append(filteredLines, line1)
 		if strings.TrimSpace(line1) == "proxies:" {
-			if strings.TrimSpace(lines1[i+1]) == "tolerance: 20" {
+			if strings.TrimSpace(buf[i+1]) == "tolerance: 20" {
 				filteredLines = append(filteredLines, "       - REJECT")
 			}
 		}
 	}
-	file, err := os.Create(file2)
-	if err != nil {
-		fmt.Println("Error creating file:", err)
-		return
-	}
-	defer file.Close() // 确保文件在函数结束时关闭
+	return filteredLines
+}
 
-	// 创建Writer
-	writer := bufio.NewWriter(file)
-
-	// 写入字符串到文件
-	for _, str := range filteredLines {
-		str = str + "\n"
-		_, err := writer.WriteString(str)
-		if err != nil {
-			fmt.Println("Error writing to file:", err)
-			return
+func getHead(buf []byte) []string {
+	var lines []string
+	scanner := bufio.NewScanner(strings.NewReader(string(buf)))
+	// 设置扫描器的分隔函数为ScanLines（按行扫描）
+	scanner.Split(bufio.ScanLines)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+		if strings.TrimSpace(string(scanner.Text())) == "proxies:" {
+			break
 		}
 	}
+	return lines
+}
+func getGroups(buf []byte) []string {
+	var lines []string
+	flag := 0
+	scanner := bufio.NewScanner(strings.NewReader(string(buf)))
+	scanner.Split(bufio.ScanLines)
+	for scanner.Scan() {
 
-	// 清空缓冲区
-	err = writer.Flush()
-	if err != nil {
-		fmt.Println("Error flushing writer:", err)
-		return
+		if strings.TrimSpace(string(scanner.Text())) == "proxy-groups:" {
+			flag = 1
+			lines = append(lines, scanner.Text())
+			continue
+		}
+		if flag == 1 {
+			if strings.TrimSpace(string(scanner.Text())) == "rules:" {
+				break
+			}
+			lines = append(lines, scanner.Text())
+		}
+
 	}
+	return lines
+}
+func getTail(buf []byte) []string {
+	var lines []string
+	flag := false
+	scanner := bufio.NewScanner(strings.NewReader(string(buf)))
+	scanner.Split(bufio.ScanLines)
+	for scanner.Scan() {
+
+		if strings.TrimSpace(string(scanner.Text())) == "rules:" {
+			flag = true
+		}
+		if flag {
+			lines = append(lines, scanner.Text())
+		}
+
+	}
+	return lines
+}
+
+// []byte转string
+func b2s(b []byte) []string {
+	str := string(b)
+	strSlice := strings.Split(str, "\n")
+	return strSlice
+
+}
+func genNewfile(file string, heads []string, Sorts []byte, newgroups1 []string, tails []string) error {
+	fp, err := os.Create(file)
+	if err != nil {
+		return err
+	}
+	defer fp.Close()
+
+	err = strWritefile(fp, heads)
+	if err != nil {
+		return err
+	}
+
+	_, err = fp.Write(Sorts)
+	if err != nil {
+		return err
+	}
+	err = strWritefile(fp, newgroups1)
+	if err != nil {
+		return err
+	}
+
+	err = strWritefile(fp, tails)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+func strWritefile(fp *os.File, buf []string) error {
+	for _, str := range buf {
+		_, err := fp.WriteString(str + "\n")
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
