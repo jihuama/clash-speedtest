@@ -6,7 +6,6 @@ Features:
 1. 无需额外的配置，直接将 Clash 配置本地文件路径或者订阅地址作为参数传入即可
 2. 支持 Proxies 和 Proxy Provider 中定义的全部类型代理节点，兼容性跟 Clash 一致
 3. 不依赖额外的 Clash 进程实例，单一工具即可完成测试
-4. 代码简单而且开源，不发布构建好的二进制文件，保证你的节点安全
 
 <img width="801" alt="image" src="https://user-images.githubusercontent.com/3659110/236233818-d149c5a9-8e62-437f-8c67-55341984184d.png">
 
