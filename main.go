@@ -1,8 +1,8 @@
 package main
 
 import (
+	"bufio"
 	"context"
-	"encoding/csv"
 	"flag"
 	"fmt"
 	"io"
@@ -31,8 +31,10 @@ var (
 	downloadSizeConfig = flag.Int("size", 1024*1024*100, "download size for testing proxies")
 	timeoutConfig      = flag.Duration("timeout", time.Second*5, "timeout for testing proxies")
 	sortField          = flag.String("sort", "b", "sort field for testing proxies, b for bandwidth, t for TTFB")
-	output             = flag.String("output", "", "output result to csv/yaml file")
+	output             = flag.String("output", "newclash.yaml", "output clash config file")
 	concurrent         = flag.Int("concurrent", 4, "download concurrent size")
+	configMap          = make(map[string]any)
+	effective          = 0
 )
 
 type CProxy struct {
@@ -64,27 +66,36 @@ func main() {
 	if *configPathConfig == "" {
 		log.Fatalln("Please specify the configuration file")
 	}
-
+	var body []byte
+	var body1 []byte
 	var allProxies = make(map[string]CProxy)
 	for _, configPath := range strings.Split(*configPathConfig, ",") {
-		var body []byte
+
 		var err error
 		if strings.HasPrefix(configPath, "http") {
 			var resp *http.Response
 			resp, err = http.Get(configPath)
 			if err != nil {
-				log.Warnln("failed to fetch config: %s", err)
-				continue
+				log.Fatalln("failed to fetch config: %s", err)
+
 			}
-			body, err = io.ReadAll(resp.Body)
+			body1, err = io.ReadAll(resp.Body)
 		} else {
-			body, err = os.ReadFile(configPath)
+			body1, err = os.ReadFile(configPath)
 		}
 		if err != nil {
-			log.Warnln("failed to read config: %s", err)
-			continue
+			log.Fatalln("failed to read config: %s", err)
+
 		}
 
+		if err := yaml.Unmarshal(body1, &configMap); err != nil {
+			log.Fatalln("fail to Unmarshal: %s", err)
+		}
+		body, err = yaml.Marshal(&configMap)
+
+		if err != nil {
+			log.Fatalln("Failed to Marshal : %s", err)
+		}
 		lps, err := loadProxies(body)
 		if err != nil {
 			log.Fatalln("Failed to convert : %s", err)
@@ -96,6 +107,10 @@ func main() {
 			}
 		}
 	}
+
+	heads := getHead(body)
+	groups := getGroups(body)
+	tails := getTail(body)
 
 	filteredProxies := filterProxies(*filterRegexConfig, allProxies)
 	results := make([]Result, 0, len(filteredProxies))
@@ -123,12 +138,12 @@ func main() {
 			sort.Slice(results, func(i, j int) bool {
 				return results[i].Bandwidth > results[j].Bandwidth
 			})
-			fmt.Println("\n\n===结果按照带宽排序===")
+			fmt.Println("\n\n------------------------结果按照带宽排序------------------------")
 		case "t", "ttfb":
 			sort.Slice(results, func(i, j int) bool {
 				return results[i].TTFB < results[j].TTFB
 			})
-			fmt.Println("\n\n===结果按照延迟排序===")
+			fmt.Println("\n\n------------------------结果按照延迟排序------------------------")
 		default:
 			log.Fatalln("Unsupported sort field: %s", *sortField)
 		}
@@ -138,15 +153,17 @@ func main() {
 		}
 	}
 
-	if strings.EqualFold(*output, "yaml") {
-		if err := writeNodeConfigurationToYAML("result.yaml", results, allProxies); err != nil {
-			log.Fatalln("Failed to write yaml: %s", err)
-		}
-	} else if strings.EqualFold(*output, "csv") {
-		if err := writeToCSV("result.csv", results); err != nil {
-			log.Fatalln("Failed to write csv: %s", err)
-		}
+	Sorts, Unsorts, err := writeNodeConfigurationToYAML(results, allProxies)
+	if err != nil {
+		log.Fatalln("Failed to analyse yaml: %s", err)
 	}
+
+	naproxys := b2s(Unsorts)
+	newgroups := delDuplicate(groups, naproxys)
+	newgroups1 := addReject(newgroups)
+	genNewfile(*output, heads, Sorts, newgroups1, tails)
+	fmt.Printf("\nTest finished, there are %d effective nodes!\n", effective)
+	fmt.Printf("Output clash config file is %s.\n", *output)
 }
 
 func filterProxies(filter string, proxies map[string]CProxy) []string {
@@ -208,7 +225,7 @@ func (r *Result) Printf(format string) {
 	} else if r.Bandwidth > 1024*1024*10 {
 		color = green
 	}
-	fmt.Printf(format, color, formatName(r.Name), formatBandwidth(r.Bandwidth), formatMilliseconds(r.TTFB))
+	fmt.Printf(format, color, r.Name, formatBandwidth(r.Bandwidth), formatMilliseconds(r.TTFB))
 }
 
 func TestProxyConcurrent(name string, proxy C.Proxy, downloadSize int, timeout time.Duration, concurrentCount int) *Result {
@@ -287,17 +304,6 @@ func TestProxy(name string, proxy C.Proxy, downloadSize int, timeout time.Durati
 	return &Result{name, bandwidth, ttfb}, written
 }
 
-var (
-	emojiRegex = regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{2600}-\x{26FF}\x{1F1E0}-\x{1F1FF}]`)
-	spaceRegex = regexp.MustCompile(`\s{2,}`)
-)
-
-func formatName(name string) string {
-	noEmoji := emojiRegex.ReplaceAllString(name, "")
-	mergedSpaces := spaceRegex.ReplaceAllString(noEmoji, " ")
-	return strings.TrimSpace(mergedSpaces)
-}
-
 func formatBandwidth(v float64) string {
 	if v <= 0 {
 		return "N/A"
@@ -328,55 +334,157 @@ func formatMilliseconds(v time.Duration) string {
 	return fmt.Sprintf("%.02fms", float64(v.Milliseconds()))
 }
 
-func writeNodeConfigurationToYAML(filePath string, results []Result, proxies map[string]CProxy) error {
-	fp, err := os.Create(filePath)
+func writeNodeConfigurationToYAML(results []Result, proxies map[string]CProxy) ([]byte, []byte, error) {
+
+	var sortedProxies []any
+	var unsortedProxies []any
+
+	for _, result := range results {
+		if v, ok := proxies[result.Name]; ok {
+			if result.TTFB > 0 {
+				sortedProxies = append(sortedProxies, v.SecretConfig)
+				effective++
+			} else {
+				unsortedProxies = append(unsortedProxies, result.Name)
+			}
+		}
+	}
+
+	bytes, _ := yaml.Marshal(sortedProxies)
+
+	bytes1, err := yaml.Marshal(unsortedProxies)
+
+	return bytes, bytes1, err
+}
+
+func delDuplicate(buf1 []string, buf2 []string) []string {
+
+	filteredLines := make([]string, 0, len(buf1))
+	for _, line1 := range buf1 {
+		if !stringInSlice(line1, buf2) {
+			filteredLines = append(filteredLines, line1)
+		}
+	}
+	return filteredLines
+
+}
+
+func stringInSlice(a string, list []string) bool {
+	for _, b := range list {
+		if strings.TrimSpace(a) == strings.TrimSpace(b) {
+			return true
+		}
+	}
+	return false
+}
+func addReject(buf []string) []string {
+
+	filteredLines := make([]string, 0, len(buf)+10)
+	for i, line1 := range buf {
+		filteredLines = append(filteredLines, line1)
+		if strings.TrimSpace(line1) == "proxies:" {
+			if strings.TrimSpace(buf[i+1]) == "tolerance: 20" || strings.TrimSpace(buf[i+1]) == "type: select" {
+				filteredLines = append(filteredLines, "        - REJECT")
+			}
+		}
+	}
+	return filteredLines
+}
+
+func getHead(buf []byte) []string {
+	var lines []string
+	scanner := bufio.NewScanner(strings.NewReader(string(buf)))
+	// 设置扫描器的分隔函数为ScanLines（按行扫描）
+	scanner.Split(bufio.ScanLines)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+		if strings.TrimSpace(string(scanner.Text())) == "proxies:" {
+			break
+		}
+	}
+	return lines
+}
+func getGroups(buf []byte) []string {
+	var lines []string
+	flag := 0
+	scanner := bufio.NewScanner(strings.NewReader(string(buf)))
+	scanner.Split(bufio.ScanLines)
+	for scanner.Scan() {
+
+		if strings.TrimSpace(string(scanner.Text())) == "proxy-groups:" {
+			flag = 1
+			lines = append(lines, scanner.Text())
+			continue
+		}
+		if flag == 1 {
+			if strings.TrimSpace(string(scanner.Text())) == "rules:" {
+				break
+			}
+			lines = append(lines, scanner.Text())
+		}
+
+	}
+	return lines
+}
+func getTail(buf []byte) []string {
+	var lines []string
+	flag := false
+	scanner := bufio.NewScanner(strings.NewReader(string(buf)))
+	scanner.Split(bufio.ScanLines)
+	for scanner.Scan() {
+
+		if strings.TrimSpace(string(scanner.Text())) == "rules:" {
+			flag = true
+		}
+		if flag {
+			lines = append(lines, scanner.Text())
+		}
+
+	}
+	return lines
+}
+
+// []byte转string
+func b2s(b []byte) []string {
+	str := string(b)
+	strSlice := strings.Split(str, "\n")
+	return strSlice
+
+}
+func genNewfile(file string, heads []string, Sorts []byte, newgroups1 []string, tails []string) error {
+	fp, err := os.Create(file)
 	if err != nil {
 		return err
 	}
 	defer fp.Close()
 
-	var sortedProxies []any
-	for _, result := range results {
-		if v, ok := proxies[result.Name]; ok {
-			sortedProxies = append(sortedProxies, v.SecretConfig)
-		}
-	}
-
-	bytes, err := yaml.Marshal(sortedProxies)
+	err = strWritefile(fp, heads)
 	if err != nil {
 		return err
 	}
 
-	_, err = fp.Write(bytes)
-	return err
+	_, err = fp.Write(Sorts)
+	if err != nil {
+		return err
+	}
+	err = strWritefile(fp, newgroups1)
+	if err != nil {
+		return err
+	}
+
+	err = strWritefile(fp, tails)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
-
-func writeToCSV(filePath string, results []Result) error {
-	csvFile, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer csvFile.Close()
-
-	// 写入 UTF-8 BOM 头
-	csvFile.WriteString("\xEF\xBB\xBF")
-
-	csvWriter := csv.NewWriter(csvFile)
-	err = csvWriter.Write([]string{"节点", "带宽 (MB/s)", "延迟 (ms)"})
-	if err != nil {
-		return err
-	}
-	for _, result := range results {
-		line := []string{
-			result.Name,
-			fmt.Sprintf("%.2f", result.Bandwidth/1024/1024),
-			strconv.FormatInt(result.TTFB.Milliseconds(), 10),
-		}
-		err = csvWriter.Write(line)
+func strWritefile(fp *os.File, buf []string) error {
+	for _, str := range buf {
+		_, err := fp.WriteString(str + "\n")
 		if err != nil {
 			return err
 		}
 	}
-	csvWriter.Flush()
 	return nil
 }
